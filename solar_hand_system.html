@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hand-Driven Solar Odyssey — Hand Navigation through Planets</title>
+  <style>
+    html,body{height:100%;margin:0;overflow:hidden;background:#000}
+    #container{width:100%;height:100%}
+    #hud{position:absolute;left:16px;top:16px;z-index:30;color:#dfefff;font-family:Inter,Arial,Helvetica,sans-serif}
+    #hud .title{font-weight:800;font-size:20px;margin-bottom:6px}
+    #hud .hint{font-size:13px;opacity:0.9}
+    #video{position:absolute;right:14px;bottom:14px;width:220px;height:165px;border-radius:10px;transform:scaleX(-1);opacity:0.95;z-index:20;box-shadow:0 10px 40px rgba(0,0,0,0.6)}
+    #label{position:absolute;right:16px;top:18px;color:#fff;z-index:20;text-align:right}
+    .btn{background:linear-gradient(90deg,#2dd4bf,#3b82f6);border:none;padding:8px 12px;border-radius:8px;color:#012;text-transform:uppercase;font-weight:700;cursor:pointer}
+  </style>
+</head>
+<body>
+<div id="container"></div>
+<video id="video" autoplay playsinline muted></video>
+<div id="hud">
+  <div class="title">Solar Odyssey</div>
+  <div class="hint">Navigate by moving your hand. Pinch to zoom in/out. Pinch near a planet to "fly" to it. Open palm to release.</div>
+  <div style="height:8px"></div>
+  <div><button id="calBtn" class="btn">Calibrate</button> <button id="resetBtn" class="btn" style="background:linear-gradient(90deg,#f97316,#ef4444);">Reset View</button></div>
+</div>
+
+<script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+// =====================================================
+// Solar Odyssey — Three.js scene + MediaPipe hand controls
+// =====================================================
+
+// -- Renderer & scene
+const container = document.getElementById('container');
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputEncoding = THREE.sRGBEncoding;
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000012);
+
+// camera (spherical orbit around target)
+const camera = new THREE.PerspectiveCamera(48, window.innerWidth/window.innerHeight, 0.01, 2000);
+let camSpherical = { radius: 60, phi: Math.PI*0.35, theta: Math.PI*0.02 };
+let camTarget = new THREE.Vector3(0,0,0);
+
+// lights
+const sunLight = new THREE.PointLight(0xffffff, 2.2, 0, 2);
+sunLight.position.set(0,0,0);
+scene.add(sunLight);
+const ambient = new THREE.AmbientLight(0x33394a, 0.6); scene.add(ambient);
+
+// stars (vibrant field)
+function makeStars(count=4000, spread=150){
+  const g = new THREE.BufferGeometry();
+  const pos = new Float32Array(count*3);
+  const col = new Float32Array(count*3);
+  for(let i=0;i<count;i++){
+    const r = Math.pow(Math.random(),0.8)*spread;
+    const theta = Math.random()*Math.PI*2;
+    const phi = Math.acos(2*Math.random()-1);
+    const x = r*Math.sin(phi)*Math.cos(theta);
+    const y = r*Math.sin(phi)*Math.sin(theta);
+    const z = r*Math.cos(phi);
+    pos[i*3]=x; pos[i*3+1]=y; pos[i*3+2]=z;
+    // color bias: cyan, violet, golden
+    const hue = (Math.random()*80 + 180)/360; // blue-cyan
+    const sat = 0.8 + Math.random()*0.2; const l = 0.5 + Math.random()*0.3;
+    const colv = new THREE.Color().setHSL(hue,sat,l);
+    col[i*3]=colv.r; col[i*3+1]=colv.g; col[i*3+2]=colv.b;
+  }
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  g.setAttribute('color', new THREE.BufferAttribute(col,3));
+  const mat = new THREE.PointsMaterial({size: 0.6, vertexColors: true, transparent:true, opacity:0.95});
+  const pts = new THREE.Points(g, mat);
+  pts.frustumCulled = false;
+  return pts;
+}
+scene.add(makeStars(7000, 600));
+
+// Sun with glow (sprite) and surface
+function makeSun(){
+  const sunGrp = new THREE.Group();
+  const geo = new THREE.SphereGeometry(6, 48, 48);
+  const mat = new THREE.MeshStandardMaterial({emissive: new THREE.Color(0xffcc66), emissiveIntensity: 1.5, color:0x552200});
+  const mesh = new THREE.Mesh(geo, mat);
+  sunGrp.add(mesh);
+  // glow sprite
+  const canvas = document.createElement('canvas'); canvas.width=256; canvas.height=256;
+  const cx = canvas.getContext('2d');
+  const grd = cx.createRadialGradient(128,128,10,128,128,128);
+  grd.addColorStop(0,'rgba(255,240,200,0.95)'); grd.addColorStop(0.3,'rgba(255,170,60,0.6)'); grd.addColorStop(1,'rgba(0,0,0,0)');
+  cx.fillStyle = grd; cx.fillRect(0,0,256,256);
+  const t = new THREE.CanvasTexture(canvas); t.needsUpdate=true;
+  const spMat = new THREE.SpriteMaterial({map:t, blending:THREE.AdditiveBlending, depthWrite:false});
+  const sp = new THREE.Sprite(spMat); sp.scale.set(30,30,1); sunGrp.add(sp);
+  return sunGrp;
+}
+const sun = makeSun(); scene.add(sun);
+
+// Planets imaginative set
+const planets = [];
+const planetDefs = [
+  {name:'Aetheria', r:1.6, dist:12, color:0x8bd3ff, speed:0.012, ring:false},
+  {name:'Cindara', r:2.4, dist:20, color:0xff8b6b, speed:0.009, ring:true},
+  {name:'Verdanis', r:2.0, dist:28, color:0x6bd36b, speed:0.007, ring:false},
+  {name:'Noctis', r:3.0, dist:38, color:0x4455ff, speed:0.005, ring:false},
+  {name:'Aurorium', r:4.5, dist:52, color:0xffd166, speed:0.003, ring:true},
+  {name:'Zephyria', r:2.8, dist:70, color:0xd68bff, speed:0.002, ring:false},
+  {name:'Obsidion', r:2.2, dist:92, color:0x999999, speed:0.0015, ring:false},
+  {name:'Solara', r:6.0, dist:120, color:0xffaa33, speed:0.001, ring:true}
+];
+
+function makePlanet(def){
+  const g = new THREE.SphereGeometry(def.r, 48, 48);
+  // canvas texture with noise band
+  const c = document.createElement('canvas'); c.width=c.height=512; const cx=c.getContext('2d');
+  cx.fillStyle = '#111'; cx.fillRect(0,0,512,512);
+  // base color
+  cx.fillStyle = '#' + def.color.toString(16).padStart(6,'0'); cx.fillRect(0,0,512,512);
+  // add simple bands
+  for(let i=0;i<30;i++){
+    const y = Math.floor(Math.random()*512);
+    cx.fillStyle = 'rgba(255,255,255,' + (Math.random()*0.02) + ')'; cx.fillRect(0,y,512,2);
+  }
+  const tex = new THREE.CanvasTexture(c); tex.needsUpdate=true;
+  const m = new THREE.MeshStandardMaterial({map:tex, metalness:0.1, roughness:0.7});
+  const mesh = new THREE.Mesh(g,m);
+  // ring
+  let ring = null;
+  if(def.ring){ const rg = new THREE.RingGeometry(def.r*1.25, def.r*2.2, 64); const rm = new THREE.MeshBasicMaterial({color:0xffffff, transparent:true, opacity:0.12, side:THREE.DoubleSide}); ring = new THREE.Mesh(rg,rm); ring.rotation.x = Math.PI/2; }
+  // label sprite
+  const lab = makeLabel(def.name);
+  return {mesh, ring, lab, def};
+}
+
+function makeLabel(text){
+  const canvas = document.createElement('canvas'); canvas.width=512; canvas.height=128; const cx=canvas.getContext('2d');
+  cx.clearRect(0,0,512,128); cx.font='700 40px Arial'; cx.textAlign='center'; cx.fillStyle='rgba(255,255,255,0.95)'; cx.fillText(text,256,72);
+  const tex = new THREE.CanvasTexture(canvas); tex.needsUpdate=true; const mat = new THREE.SpriteMaterial({map:tex, depthWrite:false}); const s = new THREE.Sprite(mat); s.scale.set(12,3,1); return s;
+}
+
+// instantiate planets in scene
+for(let i=0;i<planetDefs.length;i++){
+  const def = planetDefs[i];
+  const p = makePlanet(def);
+  p.mesh.position.set(def.dist, 0, 0);
+  if(p.ring){ p.ring.position.copy(p.mesh.position); }
+  p.lab.position.copy(p.mesh.position).add(new THREE.Vector3(0, def.r+4, 0));
+  scene.add(p.mesh); if(p.ring) scene.add(p.ring); scene.add(p.lab);
+  planets.push(p);
+}
+
+// helper: update orbit positions
+function updateOrbits(t){
+  for(let i=0;i<planets.length;i++){
+    const pd = planets[i];
+    const def = pd.def;
+    const ang = t * def.speed + i*0.4;
+    const x = Math.cos(ang) * def.dist;
+    const z = Math.sin(ang) * def.dist;
+    pd.mesh.position.set(x, 0, z);
+    if(pd.ring) pd.ring.position.set(x,0,z);
+    pd.lab.position.set(x, def.r + 4, z);
+  }
+}
+
+// camera control / hand tracking integration
+let pinchNeutral = null; // baseline pinch to calibrate
+let pinch = 0.06; let handPos = null; let handLandmarks = null; let selectedPlanet = null; let flying = false; let flyProgress = 0;
+
+// mediapipe hands
+const video = document.getElementById('video');
+const hands = new Hands({locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:0.6,minTrackingConfidence:0.6});
+
+hands.onResults(res=>{
+  if(res.multiHandLandmarks && res.multiHandLandmarks.length>0){ handLandmarks = res.multiHandLandmarks[0];
+    // compute center and pinch
+    const pts = handLandmarks;
+    const cx = (pts[0].x + pts[5].x + pts[9].x + pts[13].x + pts[17].x)/5;
+    const cy = (pts[0].y + pts[5].y + pts[9].y + pts[13].y + pts[17].y)/5;
+    handPos = {x:cx, y:cy};
+    const t4 = pts[4], t8 = pts[8];
+    pinch = Math.hypot(t4.x-t8.x, t4.y-t8.y);
+  } else { handLandmarks = null; handPos = null; }
+});
+
+const camDevice = new Camera(video, {onFrame: async () => { await hands.send({image:video}); }, width: 640, height: 480});
+camDevice.start();
+
+// calibration button
+const calBtn = document.getElementById('calBtn');
+calBtn.onclick = ()=>{
+  if(!handPos){ alert('Show your hand clearly to the camera for calibration.'); return; }
+  pinchNeutral = pinch; alert('Calibrated zoom baseline. PinchNeutral=' + pinchNeutral.toFixed(3));
+};
+
+document.getElementById('resetBtn').onclick = ()=>{ camSpherical = { radius: 60, phi: Math.PI*0.35, theta: Math.PI*0.02 }; camTarget.set(0,0,0); selectedPlanet=null; flying=false; flyProgress=0; };
+
+// project planet to screen
+function worldToScreen(vec){ const v = vec.clone(); v.project(camera); return {x:(v.x*0.5+0.5)*window.innerWidth, y:(-v.y*0.5+0.5)*window.innerHeight, ndcX:v.x, ndcY:v.y}; }
+
+// fly to planet
+function startFlyToPlanet(idx){ selectedPlanet = planets[idx]; flying = true; flyProgress = 0; }
+
+// render loop
+let last = performance.now();
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now(); const dt = (now - last)/1000; last = now;
+
+  // orbiting
+  updateOrbits(now*0.0005);
+
+  // hand controls: map handPos to rotate target
+  if(handPos){
+    // map hand normalized xy to small offsets
+    const hx = (0.5 - handPos.x) * 2.0; const hy = (handPos.y - 0.5) * 1.6;
+    // adjust camera target slightly
+    camTarget.x += (hx*8 - camTarget.x) * 0.06;
+    camTarget.y += (hy*6 - camTarget.y) * 0.06;
+    // detect pinch-based actions
+    if(pinchNeutral === null) pinchNeutral = pinch; // auto baseline if not calibrated
+    const pinchRel = (pinch - pinchNeutral);
+    // zoom mapping: smaller pinch => zoom in
+    const zoomTarget = clamp( camSpherical.radius + (-pinchRel)*160, 8, 240 );
+    camSpherical.radius += (zoomTarget - camSpherical.radius) * 0.08;
+
+    // selection: if pinched and near planet on screen, start fly
+    if(pinch < pinchNeutral * 0.7 && !flying){
+      // check proximity to each planet label
+      for(let i=0;i<planets.length;i++){
+        const scr = worldToScreen(planets[i].mesh.position);
+        const hxPx = (1-handPos.x) * window.innerWidth; const hyPx = handPos.y * window.innerHeight;
+        const d = Math.hypot(scr.x - hxPx, scr.y - hyPx);
+        if(d < Math.max(60, planets[i].def.r*12)) { startFlyToPlanet(i); break; }
+      }
+    }
+    // release
+    if(pinch > pinchNeutral * 0.95 && flying){ flying=false; selectedPlanet=null; flyProgress=0; }
+  }
+
+  // flying animation
+  if(flying && selectedPlanet){
+    flyProgress += dt * 0.6; const t = Math.min(1, flyProgress);
+    // target position near planet surface
+    const planetPos = selectedPlanet.mesh.position.clone();
+    const dir = planetPos.clone().normalize();
+    const offset = new THREE.Vector3().subVectors(planetPos, new THREE.Vector3(0,0,0)).normalize();
+    const desiredCam = planetPos.clone().add(offset.multiplyScalar(selectedPlanet.def.r*2.2 + 6));
+    // lerp camera target toward planet
+    camTarget.lerp(planetPos, t*0.9);
+    // set spherical radius to distance to desiredCam
+    const desiredRadius = desiredCam.length();
+    camSpherical.radius += (desiredRadius - camSpherical.radius) * 0.06;
+    // slowly align theta/phi to look at planet
+    // compute spherical angles for desiredCam
+    const sph = cartesianToSpherical(desiredCam);
+    camSpherical.theta += (sph.theta - camSpherical.theta) * 0.06;
+    camSpherical.phi += (sph.phi - camSpherical.phi) * 0.06;
+  }
+
+  // update camera position from spherical coords
+  const cp = sphericalToCartesian(camSpherical);
+  camera.position.set(cp.x + camTarget.x, cp.y + camTarget.y, cp.z + camTarget.z);
+  camera.lookAt(camTarget.x, camTarget.y, camTarget.z);
+
+  // animate planet rotation
+  for(let p of planets){ p.mesh.rotation.y += p.def.speed * 0.3; if(p.ring) p.ring.rotation.z += 0.001; }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+// helpers
+function sphericalToCartesian(s){ const r = s.radius; const phi = s.phi; const theta = s.theta; const x = r * Math.sin(phi) * Math.cos(theta); const z = r * Math.sin(phi) * Math.sin(theta); const y = r * Math.cos(phi); return {x,y,z}; }
+function cartesianToSpherical(v){ const r = v.length(); const phi = Math.acos( clamp(v.y / r, -1, 1) ); const theta = Math.atan2(v.z, v.x); return {radius:r, phi, theta}; }
+function clamp(a,b,c){ return Math.max(b, Math.min(c, a)); }
+
+// resize
+window.addEventListener('resize', ()=>{ camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+
+// utility: show debug overlay of screen coords if needed
+// run via console: console.log(planets.map(p=>worldToScreen(p.mesh.position)));
+
+// Finally: instructions to user printed on console
+console.log('Solar Odyssey ready — move your hand, pinch to zoom, pinch near planet to fly in, open palm to release.');
+</script>
+</body>
+</html>

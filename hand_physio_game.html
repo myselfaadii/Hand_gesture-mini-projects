@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Hand Hero — Physio Mini-Game (Hand-Gesture Controlled)</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#071324;--card:#0f2a44;--accent:#37d5ff;--good:#7effa6;--warn:#ffd166}
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#041022 0%, #071324 60%);color:#e6f7ff}
+  #wrap{position:relative;height:100vh;display:flex;align-items:center;justify-content:center}
+  canvas#game{width:100%;height:100%;display:block}
+  #uiBox{position:absolute;left:18px;top:18px;background:rgba(10,20,30,0.6);backdrop-filter:blur(6px);padding:12px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.6)}
+  #uiBox h1{margin:0;font-size:16px;font-weight:700}
+  .controls{display:flex;gap:8px;margin-top:8px}
+  button{background:var(--accent);border:none;padding:8px 12px;border-radius:8px;color:#022;cursor:pointer;font-weight:600}
+  button.secondary{background:transparent;border:1px solid rgba(255,255,255,0.08);color:#e6f7ff}
+  #video{position:absolute;right:18px;bottom:18px;width:220px;height:165px;border-radius:10px;transform:scaleX(-1);box-shadow:0 8px 30px rgba(0,0,0,0.6)}
+  #help{position:absolute;left:18px;bottom:18px;background:rgba(255,255,255,0.03);padding:10px;border-radius:10px;font-size:13px;color:#bfefff}
+  .big{font-size:22px;font-weight:800}
+  #progress{height:10px;background:rgba(255,255,255,0.06);border-radius:8px;overflow:hidden;margin-top:8px}
+  #progress > i{display:block;height:100%;background:linear-gradient(90deg,var(--good),var(--accent));width:0%}
+  #score{font-weight:700;color:var(--good);font-size:18px}
+  .small{font-size:12px;color:rgba(255,255,255,0.7)}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+  <div id="uiBox">
+    <div style="display:flex;gap:12px;align-items:center">
+      <div>
+        <div class="big">Hand Hero</div>
+        <div class="small">A simple physiotherapy mini-game — hand-only control</div>
+      </div>
+      <div style="margin-left:8px;text-align:right">
+        <div id="score">Score: 0</div>
+        <div class="small">Streak: <span id="streak">0</span></div>
+      </div>
+    </div>
+    <div id="progress"><i id="progFill"></i></div>
+    <div class="controls">
+      <button id="startBtn">Start Session</button>
+      <button class="secondary" id="calBtn">Calibrate</button>
+      <button class="secondary" id="settingsBtn">Settings</button>
+    </div>
+  </div>
+
+  <video id="video" autoplay playsinline muted></video>
+  <div id="help">Instructions: Move your hand to touch targets. <strong>Pinch</strong> to pick small balls, open palm to hold large bubbles. Hold for 2s when requested. Quick lateral swipe for "rush" targets.</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+/* ==========================
+   Simple Physio Game
+   - 2D canvas visuals
+   - MediaPipe Hands for gestures
+   - Exercises: Reach, Pinch, Hold, Swipe
+   - Accessible: calibration, big targets, adjustable difficulty
+   ==========================*/
+
+// ====== helpers ======
+function lerp(a,b,t){return a + (b-a)*t}
+function clamp(x,a,b){return Math.max(a,Math.min(b,x))}
+
+// ====== DOM ======
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d',{alpha:true});
+const video = document.getElementById('video');
+const startBtn = document.getElementById('startBtn');
+const calBtn = document.getElementById('calBtn');
+const scoreEl = document.getElementById('score');
+const streakEl = document.getElementById('streak');
+const progFill = document.getElementById('progFill');
+
+let W = innerWidth, H = innerHeight;
+canvas.width = W; canvas.height = H;
+window.addEventListener('resize', ()=>{W = innerWidth; H = innerHeight; canvas.width = W; canvas.height = H});
+
+// ====== game state ======
+let running = false;
+let score = 0; let streak = 0;
+let sessionTime = 60; // seconds
+let elapsed = 0;
+let spawnTimer = 0;
+let targets = [];
+let confetti = [];
+let difficulty = 1; // 1 easy, 2 medium, 3 hard
+
+// calibration (maps normalized hand to canvas comfortably)
+let calib = {ready:false, palmSize:0.18, xOffset:0, yOffset:0, scale:1.0};
+
+// audio beep
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function beep(f=880,d=0.06){const o=audioCtx.createOscillator(); const g=audioCtx.createGain(); o.connect(g); g.connect(audioCtx.destination); o.type='sine'; o.frequency.value=f; g.gain.value=0.001; o.start(); g.gain.linearRampToValueAtTime(0.03,audioCtx.currentTime+0.01); g.gain.linearRampToValueAtTime(0.001,audioCtx.currentTime+d); o.stop(audioCtx.currentTime+d+0.02);}
+
+// ====== gestures using MediaPipe landmarks ======
+let lastHand = null; // {x,y,z,t, pinch, open, vx, vy}
+function getHandState(landmarks){
+  if(!landmarks) return null;
+  // normalized coords (0-1) from MediaPipe, mirrored horizontally
+  // compute center (average of wrist and MCPs)
+  const pts = landmarks;
+  const cx = (pts[0].x + pts[5].x + pts[9].x + pts[13].x + pts[17].x)/5;
+  const cy = (pts[0].y + pts[5].y + pts[9].y + pts[13].y + pts[17].y)/5;
+  const zAvg = pts.reduce((s,p)=>s+p.z,0)/pts.length;
+  const tNow = performance.now()/1000;
+  if(!lastHand) lastHand = {x:cx,y:cy,z:zAvg,t:tNow, pinch:0, open:0, vx:0, vy:0};
+
+  const dt = Math.max(0.001, tNow - lastHand.t);
+  const vx = (cx - lastHand.x)/dt;
+  const vy = (cy - lastHand.y)/dt;
+
+  // pinch: distance thumb tip (4) to index tip (8)
+  const thumb = pts[4], index = pts[8];
+  const pinchDist = Math.hypot(thumb.x-index.x, thumb.y-index.y);
+
+  // open: average distance between finger tips and palm base
+  const tips = [8,12,16,20];
+  let dsum = 0;
+  for(let i of tips){ dsum += Math.hypot(pts[i].x - pts[0].x, pts[i].y - pts[0].y); }
+  const openScore = dsum / tips.length;
+
+  lastHand = {x:cx, y:cy, z:zAvg, t:tNow, pinch:pinchDist, open:openScore, vx, vy};
+  return lastHand;
+}
+
+// gestures decisions (thresholds adapted by calibration)
+function isPinching(h){ if(!h) return false; return h.pinch < calib.palmSize*0.6; }
+function isOpenPalm(h){ if(!h) return false; return h.open > calib.palmSize * 1.2; }
+function isSwipe(h){ if(!h) return false; return Math.abs(h.vx) > 1.0 * difficulty; }
+function handToScreen(h){ if(!h) return null; // map normalized (0..1) to canvas coords, note MediaPipe x is left->right
+  const mx = 1 - h.x; // mirror so video feels natural
+  const x = (mx + calib.xOffset - 0.5) * calib.scale * W + W/2;
+  const y = (h.y + calib.yOffset - 0.5) * calib.scale * H + H/2;
+  return {x,y};
+}
+
+// ====== targets types ======
+// Reach: large bubble — open palm hold
+// Pinch: small ball — pinch to collect quickly
+// Hold: medium — hold open palm for X sec
+// Swipe: fast ribbon — swipe across
+function spawnTarget(){
+  const types = ['reach','pinch','hold','swipe'];
+  // weighted by difficulty
+  let weights = difficulty==1 ? [0.4,0.3,0.2,0.1] : difficulty==2 ? [0.3,0.3,0.25,0.15] : [0.2,0.35,0.25,0.2];
+  const r = Math.random(); let sum=0; let type='reach';
+  for(let i=0;i<types.length;i++){ sum+=weights[i]; if(r<=sum){ type=types[i]; break; } }
+
+  const x = 80 + Math.random()*(W-160);
+  const y = 80 + Math.random()*(H-200);
+  const t = {id:Math.random().toString(36).slice(2),type,x,y,age:0,ttl:6 + Math.random()*6,done:false};
+  // specific sizes/durations
+  if(type=='reach'){ t.r = 70; t.hold=1.5; }
+  if(type=='pinch'){ t.r = 26; t.hold=0.15; }
+  if(type=='hold'){ t.r = 46; t.hold=2.2; }
+  if(type=='swipe'){ t.r = 14; t.hold=0.09; t.dir = Math.random()<0.5? 'h':'v'; }
+  targets.push(t);
+}
+
+// ====== confetti ======
+function spawnConfetti(x,y,count=24){ for(let i=0;i<count;i++){ confetti.push({x,y,vx:(Math.random()-0.5)*6,vy:(Math.random()-1.8)*5,age:0,life:1+Math.random()*0.7,color:`hsl(${Math.random()*360},80%,60%)`}); } }
+
+// ====== main loop ======
+let lastFrame = performance.now();
+function update(dt,handState){
+  // spawn
+  spawnTimer -= dt;
+  if(spawnTimer <= 0){ spawnTimer = lerp(1.0,0.6,Math.random()) / difficulty; spawnTarget(); }
+
+  // update targets
+  for(let t of targets){ t.age += dt; if(t.age > t.ttl) t.expire = true; }
+  targets = targets.filter(t=>!t.expire && !t.done);
+
+  // interaction
+  const hs = handState ? handToScreen(handState) : null;
+  if(hs){
+    // check each target
+    for(let t of targets){ if(t.done) continue; const dx = hs.x - t.x, dy = hs.y - t.y; const d = Math.hypot(dx,dy);
+      if(t.type==='reach'){
+        if(d < t.r * 0.9 && isOpenPalm(handState)){
+          // require hold for t.hold seconds
+          t.holdTimer = (t.holdTimer||0) + dt;
+          if(t.holdTimer >= t.hold){ collectTarget(t,true); }
+        } else { t.holdTimer = 0; }
+      } else if(t.type==='pinch'){
+        if(d < t.r + 14 && isPinching(handState)){
+          collectTarget(t,true);
+        }
+      } else if(t.type==='hold'){
+        if(d < t.r && isOpenPalm(handState)){
+          t.holdTimer = (t.holdTimer||0) + dt;
+          if(t.holdTimer >= t.hold){ collectTarget(t,true); }
+        } else t.holdTimer = 0;
+      } else if(t.type==='swipe'){
+        // detect quick crossing velocity near target
+        if(d < 120 && Math.abs(handState.vx) > 1.1){ collectTarget(t,true); }
+      }
+    }
+  }
+
+  // confetti
+  for(let c of confetti){ c.age += dt; c.x += c.vx; c.y += c.vy; c.vy += 0.1; }
+  confetti = confetti.filter(c=>c.age < c.life);
+
+  // update ui
+  scoreEl.textContent = `Score: ${score}`;
+  streakEl.textContent = `${streak}`;
+  progFill.style.width = `${clamp(100*(elapsed/sessionTime),0,100)}%`;
+}
+
+function collectTarget(t,good){ if(t.done) return; t.done = true; if(good){ score += 10; streak += 1; beep(900,0.05); spawnConfetti(t.x,t.y,18); } else { streak = 0; }
+  // small visual + remove after
+  setTimeout(()=>{ targets = targets.filter(tt=>tt.id!==t.id); }, 250);
+}
+
+function draw(handState){
+  ctx.clearRect(0,0,W,H);
+  // background gradient
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'rgba(6,20,36,0.6)'); g.addColorStop(1,'rgba(4,10,20,0.9)');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+  // draw targets
+  for(let t of targets){
+    // animate appearance
+    const a = clamp(1 - (t.age / t.ttl), 0, 1);
+    ctx.save();
+    if(t.type==='reach'){
+      ctx.beginPath(); ctx.fillStyle = 'rgba(55,213,255,0.07)'; ctx.strokeStyle='rgba(55,213,255,0.6)'; ctx.lineWidth=4; ctx.arc(t.x,t.y,t.r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle='rgba(55,213,255,0.95)'; ctx.font='600 18px Inter'; ctx.textAlign='center'; ctx.fillText('REACH',t.x,t.y+6);
+    } else if(t.type==='pinch'){
+      ctx.beginPath(); ctx.fillStyle='rgba(255,214,102,0.12)'; ctx.strokeStyle='rgba(255,214,102,0.9)'; ctx.lineWidth=3; ctx.arc(t.x,t.y,t.r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.fillStyle='rgba(255,214,102,0.95)'; ctx.arc(t.x,t.y,6,0,Math.PI*2); ctx.fill(); ctx.font='700 13px Inter'; ctx.fillText('PINCH',t.x,t.y+28);
+    } else if(t.type==='hold'){
+      ctx.beginPath(); ctx.fillStyle='rgba(126,255,166,0.08)'; ctx.strokeStyle='rgba(126,255,166,0.9)'; ctx.lineWidth=3; ctx.arc(t.x,t.y,t.r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+      // progress ring
+      const pct = (t.holdTimer||0)/t.hold;
+      ctx.beginPath(); ctx.strokeStyle='rgba(126,255,166,0.95)'; ctx.lineWidth=6; ctx.arc(t.x,t.y,t.r+10,-Math.PI/2, -Math.PI/2 + Math.PI*2*pct); ctx.stroke(); ctx.font='700 14px Inter'; ctx.fillStyle='rgba(126,255,166,0.95)'; ctx.fillText('HOLD',t.x,t.y+6);
+    } else if(t.type==='swipe'){
+      ctx.beginPath(); ctx.fillStyle='rgba(255,110,189,0.08)'; ctx.strokeStyle='rgba(255,110,189,0.95)'; ctx.lineWidth=2; ctx.rect(t.x-24,t.y-8,48,16); ctx.fill(); ctx.stroke(); ctx.font='700 12px Inter'; ctx.fillStyle='rgba(255,110,189,0.95)'; ctx.fillText('SWIPE',t.x,t.y+4);
+    }
+    ctx.restore();
+  }
+
+  // draw confetti
+  for(let c of confetti){ ctx.fillStyle = c.color; ctx.fillRect(c.x, c.y, 4, 6); }
+
+  // draw hand cursor
+  if(handState){ const hs = handToScreen(handState); ctx.save(); ctx.beginPath(); ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.arc(hs.x,hs.y,28,0,Math.PI*2); ctx.fill(); ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=2; ctx.stroke(); // gesture icon
+    if(isPinching(handState)){
+      ctx.fillStyle='rgba(255,214,102,0.95)'; ctx.beginPath(); ctx.arc(hs.x,hs.y,10,0,Math.PI*2); ctx.fill(); ctx.strokeStyle='rgba(0,0,0,0.2)'; ctx.stroke();
+    } else if(isOpenPalm(handState)){
+      ctx.fillStyle='rgba(126,255,166,0.95)'; ctx.beginPath(); ctx.arc(hs.x,hs.y,10,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+    ctx.restore(); }
+
+  // HUD hints
+  ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fillRect(20,H-120,260,90); ctx.fillStyle='#e6f7ff'; ctx.font='600 14px Inter'; ctx.fillText('Tips',34,H-96);
+  ctx.font='13px Inter'; ctx.fillStyle='rgba(229,247,255,0.85)'; ctx.fillText('- Reach: open palm & hold on bubble for few seconds',34,H-70);
+  ctx.fillText('- Pinch small balls with thumb+index',34,H-48);
+}
+
+// ====== MediaPipe setup ======
+const hands = new Hands({locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:0.6,minTrackingConfidence:0.5});
+let currentLandmarks = null;
+
+hands.onResults((res)=>{
+  if(res.multiHandLandmarks && res.multiHandLandmarks.length>0){ currentLandmarks = res.multiHandLandmarks[0]; }
+  else currentLandmarks = null;
+});
+
+const cam = new Camera(video, { onFrame: async () => { await hands.send({image: video}); }, width: 640, height: 480 });
+cam.start();
+
+// ====== calibration ======
+calBtn.addEventListener('click', ()=>{
+  alert('Calibration: place an open palm at comfortable distance in front of camera and press OK.');
+  if(!currentLandmarks) return alert('No hand detected — show your hand clearly to the camera.');
+  // palm size approx distance between wrist and middle fingertip
+  const pts = currentLandmarks;
+  const d = Math.hypot(pts[9].x-pts[0].x, pts[9].y-pts[0].y);
+  calib.palmSize = d; calib.ready = true;
+  calib.scale = 1.0; calib.xOffset = 0; calib.yOffset = 0;
+  alert('Calibration saved. Palm size = ' + d.toFixed(3));
+});
+
+// ====== session controls ======
+startBtn.addEventListener('click', ()=>{
+  if(!running){ // start
+    if(!calib.ready) { if(!confirm('Calibration not done. Continue anyway?')) return; }
+    running = true; startBtn.textContent='Stop Session'; elapsed = 0; score = 0; streak = 0; targets=[]; confetti=[]; spawnTimer = 0.2; lastFrame = performance.now();
+  } else { running = false; startBtn.textContent='Start Session'; }
+});
+
+// ====== game tick ======
+function loop(){
+  const now = performance.now();
+  const dt = Math.min(0.06, (now - lastFrame)/1000);
+  lastFrame = now;
+
+  if(running){ elapsed += dt; if(elapsed >= sessionTime){ running=false; startBtn.textContent='Start Session'; alert('Session ended! Score: '+score); }
+    update(dt, getHandState(currentLandmarks)); }
+  draw(getHandState(currentLandmarks));
+  requestAnimationFrame(loop);
+}
+loop();
+
+// small UX: unlock audio on first user gesture
+window.addEventListener('click', ()=>{ if(audioCtx.state!=='running') audioCtx.resume(); });
+
+// helper re-exported for debugging
+window.__physio = { getHandState: ()=> getHandState(currentLandmarks), targets }
+</script>
+</body>
+</html>
